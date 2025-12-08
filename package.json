@@ -6,6 +6,7 @@
     "f2v": "./dist/bin/f2v.js",
     "v2f": "./dist/bin/v2f.js"
   },
+  "author": "BACKGWA",
   "license": "MIT",
   "type": "commonjs",
   "scripts": {
