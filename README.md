@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="res/Fideo.png" width=320>
+<img src="res/Fideo.png" width=300><br>
 
 **Fideo** is a simple utility that lets you **encode files into MP4 format** or **decode encoded MP4 files back to their original format**.
 It offers an easy-to-use, command-line–based interface.
