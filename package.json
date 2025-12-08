@@ -1,0 +1,26 @@
+{
+  "name": "fideo",
+  "version": "1.0.0",
+  "description": "Fideo - File2Video & Video2File",
+  "bin": {
+    "f2v": "./dist/bin/f2v.js",
+    "v2f": "./dist/bin/v2f.js"
+  },
+  "license": "MIT",
+  "type": "commonjs",
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
+    "@ffprobe-installer/ffprobe": "^1.4.1",
+    "chalk": "^4.1.2",
+    "commander": "^13.1.0",
+    "ora": "^8.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.1",
+    "typescript": "^5.9.3"
+  }
+}
