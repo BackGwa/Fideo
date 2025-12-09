@@ -1,19 +1,50 @@
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { spawn } from 'child_process';
 import { once } from 'events';
-import ora from 'ora';
-
+import cliProgress from 'cli-progress';
+import chalk from 'chalk';
 import { computeLayout } from './layout';
-import { formatBytes, getExtension, pathExists } from './utils';
-import { logInfo, logWarn, styleKV, colors } from './logger';
+import { getExtension } from './utils';
+import { logInfo, logWarn, styleKV } from './logger';
 import { ffmpegPath } from './ffmpeg-path';
 
 const ensureVideoPath = (targetPath: string): string => {
   const parsed = path.parse(targetPath);
   if (parsed.ext) return targetPath;
-  const base = parsed.name || parsed.base || 'output';
-  return path.join(parsed.dir || '.', `${base}.mp4`);
+  return path.join(parsed.dir || '.', `${parsed.name || parsed.base || 'output'}.mp4`);
+};
+
+interface ChunkInfo {
+  index: number;
+  start: number;
+  end: number;
+  size: number;
+}
+
+const readChunk = async (
+  filePath: string,
+  chunk: ChunkInfo,
+  metadataBuffer: Buffer | null
+): Promise<Buffer> => {
+  const buffers: Buffer[] = [];
+
+  if (metadataBuffer && chunk.index === 0) {
+    buffers.push(metadataBuffer);
+  }
+
+  const stream = fs.createReadStream(filePath, {
+    start: chunk.start,
+    end: chunk.end - 1,
+    highWaterMark: 256 * 1024
+  });
+
+  for await (const data of stream) {
+    buffers.push(data as Buffer);
+  }
+
+  return Buffer.concat(buffers);
 };
 
 export const encodeFileToVideo = async (
@@ -30,39 +61,59 @@ export const encodeFileToVideo = async (
     throw new Error('Input file not found.');
   }
 
-  const fileSize = stats.size;
-  const extension = getExtension(inputPath);
-  const metadata = `${extension};${fileSize};`;
-  const metadataBuffer = Buffer.from(metadata, 'utf8');
-  const totalDataBytes = metadataBuffer.length + fileSize;
-  const layout = computeLayout(totalDataBytes, forcedResolution ?? undefined);
-  const paddingBytes = layout.padding;
   const targetPath = ensureVideoPath(
     outputPath ?? path.join(path.dirname(inputPath), `${path.parse(inputPath).name}.mp4`)
   );
 
-  if (await pathExists(targetPath)) {
+  if (fs.existsSync(targetPath)) {
     logWarn('Output path exists and will be overwritten.');
   }
+
+  const fileSize = stats.size;
+  const metadataBuffer = Buffer.from(`${getExtension(inputPath)};${fileSize};`, 'utf8');
+  const totalDataBytes = metadataBuffer.length + fileSize;
+  const layout = computeLayout(totalDataBytes, forcedResolution ?? undefined);
+  const paddingBytes = layout.padding;
 
   logInfo(styleKV('Input file', inputPath));
   logInfo(styleKV('Output video', targetPath));
   logInfo(
     `${styleKV('Resolution', `${layout.dimension}x${layout.dimension}`)}, ` +
-      `${colors.magenta('Frames')}: ${colors.white(String(layout.frames))}, ` +
-      `${colors.magenta('FPS')}: ${colors.white(String(layout.fps))}`
+      `${chalk.magenta('Frames')}: ${chalk.white(String(layout.frames))}, ` +
+      `${chalk.magenta('FPS')}: ${chalk.white(String(layout.fps))}`
   );
-  logInfo(
-    `${styleKV('Metadata', `${metadataBuffer.length}B`)}, ` +
-      `${colors.magenta('Payload')}: ${colors.white(formatBytes(fileSize))}, ` +
-      `${colors.magenta('Padding')}: ${colors.white(formatBytes(paddingBytes))}`
+  console.log();
+
+  const cpuCount = os.cpus().length;
+  const chunkSize = Math.ceil(fileSize / cpuCount);
+  const chunks: ChunkInfo[] = [];
+
+  for (let i = 0; i < cpuCount; i++) {
+    const start = i * chunkSize;
+    const end = Math.min((i + 1) * chunkSize, fileSize);
+    if (start >= fileSize) break;
+    chunks.push({ index: i, start, end, size: end - start });
+  }
+
+  const chunkBuffers = await Promise.all(
+    chunks.map(chunk => readChunk(inputPath, chunk, chunk.index === 0 ? metadataBuffer : null))
   );
 
-  const spinner = ora({ text: 'Encoding...', color: 'cyan' }).start();
+  const totalBuffer = paddingBytes > 0
+    ? Buffer.concat([...chunkBuffers, Buffer.alloc(paddingBytes, 0)])
+    : Buffer.concat(chunkBuffers);
+
+  const encodingBar = new cliProgress.SingleBar({
+    format: 'Encoding | {bar} | {percentage}%',
+    hideCursor: true,
+    clearOnComplete: true
+  }, cliProgress.Presets.shades_classic);
+
+  encodingBar.start(totalDataBytes, 0);
+
   let processed = 0;
-  const updateSpinner = () => {
-    const pct = Math.min(100, (processed / totalDataBytes) * 100);
-    spinner.text = `Encoding ${pct.toFixed(1)}% (${formatBytes(processed)}/${formatBytes(totalDataBytes)})`;
+  const updateProgress = () => {
+    encodingBar.update(processed);
   };
 
   const ffmpegProcess = spawn(
@@ -105,79 +156,45 @@ export const encodeFileToVideo = async (
 
   const stderrChunks: string[] = [];
   ffmpegProcess.stderr?.on('data', (chunk: Buffer) => stderrChunks.push(chunk.toString()));
-  let spawnErrorMessage: string | null = null;
+
   const exitPromise = new Promise<number | null>((resolve) => {
-    ffmpegProcess.on('error', (err: Error) => {
-      spawnErrorMessage = err.message;
-      resolve(null);
-    });
+    ffmpegProcess.on('error', () => resolve(null));
     ffmpegProcess.on('close', (code: number | null) => resolve(code));
   });
 
-  let streamError: Error | null = null;
-  ffmpegProcess.stdin?.on('error', (err: Error) => {
-    streamError = err;
-  });
-
   const sendStream = async (): Promise<void> => {
-    const stdin = ffmpegProcess.stdin;
-    if (!stdin) {
-      throw new Error('FFmpeg stdin is not available.');
-    }
+    const stdin = ffmpegProcess.stdin!;
+    const chunkWriteSize = 64 * 1024;
+    let offset = 0;
 
-    const writeChunk = async (chunk: Buffer) => {
+    while (offset < totalBuffer.length) {
+      const chunk = totalBuffer.subarray(offset, offset + chunkWriteSize);
       if (!stdin.write(chunk)) {
         await once(stdin, 'drain');
       }
       processed += chunk.length;
-      updateSpinner();
-    };
-
-    await writeChunk(metadataBuffer);
-
-    const readStream = fs.createReadStream(inputPath);
-    for await (const chunk of readStream) {
-      await writeChunk(chunk as Buffer);
-    }
-
-    if (streamError) {
-      throw streamError;
-    }
-
-    if (paddingBytes > 0) {
-      const padding = Buffer.alloc(paddingBytes, 0);
-      await writeChunk(padding);
-    }
-
-    if (streamError) {
-      throw streamError;
+      offset += chunk.length;
+      updateProgress();
     }
 
     stdin.end();
   };
 
-  let sendErrorMessage: string | null = null;
   try {
     await sendStream();
   } catch (err) {
-    sendErrorMessage = err instanceof Error ? err.message : String(err);
     ffmpegProcess.kill('SIGKILL');
+    encodingBar.stop();
+    throw new Error(err instanceof Error ? err.message : String(err));
   }
 
   const exitCode = await exitPromise;
-  const detail = stderrChunks.join('').trim();
-  if (spawnErrorMessage) {
-    spinner.fail('Failed to start ffmpeg.');
-    throw new Error(`Failed to start ffmpeg: ${spawnErrorMessage}`);
-  }
-  if (sendErrorMessage) {
-    spinner.fail('Video encoding failed.');
-    throw new Error(detail || sendErrorMessage || 'Video encoding failed.');
-  }
   if (exitCode !== 0) {
-    spinner.fail('Video encoding failed.');
+    encodingBar.stop();
+    const detail = stderrChunks.join('').trim();
     throw new Error(detail || 'Video encoding failed.');
   }
 
-  spinner.succeed('Video created successfully.');
+  encodingBar.stop();
+  logInfo(chalk.green('Video created successfully.'));
 };

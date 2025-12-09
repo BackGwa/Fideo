@@ -2,27 +2,21 @@ import fs from 'fs';
 import path from 'path';
 import { spawn } from 'child_process';
 import { once } from 'events';
-import ora from 'ora';
-
-import { formatBytes } from './utils';
-import { logInfo, logWarn, colors, styleKV } from './logger';
+import cliProgress from 'cli-progress';
+import chalk from 'chalk';
+import { logInfo, logWarn, styleKV } from './logger';
 import { probeVideo } from './probe';
 import { ffmpegPath } from './ffmpeg-path';
+import { sanitizeExtension } from './utils';
 
 const METADATA_DELIMITER = 59;
-const MAX_METADATA_BYTES = 1024;
-
-const sanitizeExtension = (ext: string | null | undefined): string => {
-  const cleaned = (ext || '').replace(/[^A-Za-z0-9_-]/g, '').toLowerCase();
-  return cleaned || 'bin';
-};
+const MAX_METADATA_BYTES = 128;
 
 const resolveOutputPath = (videoPath: string, provided: string | null, ext: string): string => {
   if (provided) {
     const parsed = path.parse(provided);
     if (parsed.ext) return provided;
-    const base = parsed.name || parsed.base || 'output';
-    return path.join(parsed.dir || '.', `${base}.${ext}`);
+    return path.join(parsed.dir || '.', `${parsed.name || parsed.base || 'output'}.${ext}`);
   }
   const parsed = path.parse(videoPath);
   return path.join(parsed.dir, `${parsed.name}.${ext}`);
@@ -38,41 +32,32 @@ export const decodeVideoToFile = async (inputVideoPath: string, outputPath?: str
     throw new Error('Input video not found.');
   }
 
-  const videoInfo = await probeVideo(inputVideoPath).catch((err: Error) => {
-    throw new Error(`Failed to read video info: ${err.message}`);
-  });
+  const videoInfo = await probeVideo(inputVideoPath);
 
   logInfo(styleKV('Input video', inputVideoPath));
   logInfo(
     `${styleKV('Resolution', `${videoInfo.width}x${videoInfo.height}`)}, ` +
-      `${colors.magenta('FPS')}: ${colors.white(videoInfo.fps ? videoInfo.fps.toFixed(2) : 'unknown')}`
+      `${chalk.magenta('FPS')}: ${chalk.white(videoInfo.fps ? videoInfo.fps.toFixed(2) : 'unknown')}`
   );
   if (videoInfo.width !== videoInfo.height || videoInfo.width % 2 !== 0) {
     logWarn('Video is not an even square; extraction may differ from expectations.');
   }
+  console.log();
 
   const ffmpegProcess = spawn(
     ffmpegPath,
     ['-loglevel', 'error', '-i', inputVideoPath, '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'],
     { stdio: ['ignore', 'pipe', 'pipe'] }
   );
-  const spinner = ora({ text: 'Decoding...', color: 'cyan' }).start();
+
+  let decodingBar: cliProgress.SingleBar | undefined;
   let expectedSize: number | null = null;
   let received = 0;
-  let lastPct = -1;
+
   const setProgress = () => {
-    if (!Number.isFinite(expectedSize) || expectedSize === null || expectedSize <= 0) return;
-    const pct = Math.min(100, (received / expectedSize) * 100);
-    if (pct === 100 || pct - lastPct >= 1) {
-      lastPct = pct;
-      spinner.text = `Decoding ${pct.toFixed(1)}% (${formatBytes(received)}/${formatBytes(expectedSize)})`;
+    if (expectedSize !== null && expectedSize > 0 && decodingBar) {
+      decodingBar.update(received);
     }
-  };
-  const emitWarn = (message: string) => {
-    const text = spinner.text;
-    spinner.stop();
-    logWarn(message);
-    spinner.start(text);
   };
 
   const stderrChunks: string[] = [];
@@ -101,19 +86,16 @@ export const decodeVideoToFile = async (inputVideoPath: string, outputPath?: str
 
     const processPayload = async (chunk: Buffer) => {
       if (expectedSize === null || received >= expectedSize) return;
-      if (!writer) {
-        throw new Error('Output writer is not initialized.');
-      }
       const needed = expectedSize - received;
       const slice = chunk.subarray(0, Math.min(chunk.length, needed));
       if (slice.length > 0) {
-        if (!writer.write(slice)) {
-          await once(writer, 'drain');
+        if (!writer!.write(slice)) {
+          await once(writer!, 'drain');
         }
         received += slice.length;
         setProgress();
       }
-      if (expectedSize !== null && received >= expectedSize) {
+      if (received >= expectedSize) {
         writer?.end();
         ffmpegProcess.stdout?.pause();
         ffmpegProcess.kill('SIGTERM');
@@ -129,25 +111,22 @@ export const decodeVideoToFile = async (inputVideoPath: string, outputPath?: str
           if (metaLength >= MAX_METADATA_BYTES) {
             throw new Error('Could not find metadata header.');
           }
-          metaBuffer[metaLength] = byte;
-          metaLength += 1;
-          if (byte === METADATA_DELIMITER) semicolons += 1;
-
-          if (semicolons >= 2) {
+          metaBuffer[metaLength++] = byte;
+          if (byte === METADATA_DELIMITER && ++semicolons >= 2) {
             metadataParsed = true;
             const metaText = metaBuffer.subarray(0, metaLength).toString('utf8');
             const parts = metaText.split(';');
-            extension = sanitizeExtension(parts[0] || 'bin');
+            extension = sanitizeExtension(parts[0]);
             expectedSize = Number(parts[1]);
             if (!Number.isFinite(expectedSize) || expectedSize < 0) {
               throw new Error('File size in metadata is invalid.');
             }
             outputTarget = resolveOutputPath(inputVideoPath, outputTarget, extension);
             if (providedExt && providedExt !== extension) {
-              emitWarn(`Output extension (.${providedExt}) differs from metadata (.${extension}).`);
+              logWarn(`Output extension (.${providedExt}) differs from metadata (.${extension}).`);
             }
             if (!outputPath && fs.existsSync(outputTarget)) {
-              emitWarn('Output file exists and will be overwritten.');
+              logWarn('Output file exists and will be overwritten.');
             }
             writer = fs.createWriteStream(outputTarget);
             writer.setMaxListeners(0);
@@ -155,7 +134,14 @@ export const decodeVideoToFile = async (inputVideoPath: string, outputPath?: str
               ffmpegProcess.kill('SIGKILL');
               settle(err);
             });
-            spinner.info(`Extracting to: ${outputTarget} (${formatBytes(expectedSize)})`);
+
+            decodingBar = new cliProgress.SingleBar({
+              format: 'Decoding | {bar} | {percentage}%',
+              hideCursor: true,
+              clearOnComplete: true
+            }, cliProgress.Presets.shades_classic);
+
+            decodingBar.start(expectedSize, 0);
 
             if (expectedSize === 0) {
               writer.end();
@@ -193,22 +179,11 @@ export const decodeVideoToFile = async (inputVideoPath: string, outputPath?: str
     });
 
     ffmpegProcess.on('error', (err) => settle(new Error(`Failed to start ffmpeg: ${err.message}`)));
-
     ffmpegProcess.on('close', (code: number | null) => {
       if (done) return;
-      const detail = stderrChunks.join('').trim();
-      if (!metadataParsed) {
-        spinner.fail('Failed to read metadata.');
-        settle(new Error(detail || 'Failed to read metadata.'));
-        return;
-      }
-      if (expectedSize !== null && received < expectedSize) {
-        spinner.fail('File extraction failed.');
-        settle(new Error('Did not read all file bytes from the video.'));
-        return;
-      }
-      if (code !== 0) {
-        spinner.fail('File extraction failed.');
+      if (!metadataParsed || (expectedSize !== null && received < expectedSize) || code !== 0) {
+        decodingBar?.stop();
+        const detail = stderrChunks.join('').trim();
         settle(new Error(detail || 'Video decoding failed.'));
         return;
       }
@@ -216,12 +191,7 @@ export const decodeVideoToFile = async (inputVideoPath: string, outputPath?: str
     });
   });
 
-  if (expectedSize === null || outputTarget === null) {
-    spinner.fail('File extraction failed.');
-    throw new Error('Not enough information to extract the file.');
-  }
-
-  spinner.succeed('File extracted successfully.');
-
-  return outputTarget;
+  decodingBar?.stop();
+  logInfo(chalk.green('File extracted successfully.'));
+  return outputTarget!;
 };

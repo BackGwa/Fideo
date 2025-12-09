@@ -1,6 +1,6 @@
 export const MIN_DIMENSION = 16;
 export const MAX_DIMENSION = 2048;
-export const MIN_FPS = 4;
+export const MIN_FPS = 2;
 export const MAX_FPS = 60;
 
 export interface Layout {
@@ -23,10 +23,6 @@ export const selectFps = (frameCount: number): number => {
 };
 
 export const computeLayout = (totalBytes: number, forcedDimension?: number | null): Layout => {
-  if (!Number.isFinite(totalBytes) || totalBytes < 0) {
-    throw new Error('Total bytes must be a non-negative number.');
-  }
-
   const buildLayout = (dim: number) => {
     const frameSize = dim * dim * 3;
     const frames = Math.max(1, Math.ceil(totalBytes / frameSize));
@@ -40,34 +36,30 @@ export const computeLayout = (totalBytes: number, forcedDimension?: number | nul
     };
   };
 
-  if (forcedDimension !== undefined && forcedDimension !== null) {
-    const dim = clampEven(forcedDimension, MIN_DIMENSION, MAX_DIMENSION);
-    const layout = buildLayout(dim);
+  if (forcedDimension) {
+    const layout = buildLayout(clampEven(forcedDimension, MIN_DIMENSION, MAX_DIMENSION));
     return { ...layout, fps: selectFps(layout.frames) };
   }
 
   let best: ReturnType<typeof buildLayout> | null = null;
 
-  for (let dim = MIN_DIMENSION; dim <= MAX_DIMENSION; dim += 2) {
+  for (let dim = MAX_DIMENSION; dim >= MIN_DIMENSION; dim -= 2) {
     const layout = buildLayout(dim);
-    if (!best) {
-      best = layout;
-      continue;
-    }
-    const smallerVideo = layout.totalVideoBytes < best.totalVideoBytes;
-    const sameVideoLessPadding = layout.totalVideoBytes === best.totalVideoBytes && layout.padding < best.padding;
-    const sameBothSmallerDim =
-      layout.totalVideoBytes === best.totalVideoBytes &&
-      layout.padding === best.padding &&
-      layout.dimension < best.dimension;
 
-    if (smallerVideo || sameVideoLessPadding || sameBothSmallerDim) {
+    if (layout.frames < MIN_FPS) continue;
+
+    if (
+      !best ||
+      layout.frames < best.frames ||
+      (layout.frames === best.frames && layout.padding < best.padding) ||
+      (layout.frames === best.frames && layout.padding === best.padding && layout.dimension > best.dimension)
+    ) {
       best = layout;
     }
   }
 
   if (!best) {
-    throw new Error('Unable to compute layout.');
+    best = buildLayout(MAX_DIMENSION);
   }
 
   return { ...best, fps: selectFps(best.frames) };
