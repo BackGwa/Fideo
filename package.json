@@ -15,6 +15,10 @@
   },
   "author": "BACKGWA",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/BackGwa/Fideo.git"
+  },
   "type": "commonjs",
   "scripts": {
     "build": "tsc",
