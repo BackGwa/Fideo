@@ -8,6 +8,9 @@ import { computeLayout } from './layout';
 import { getExtension } from './utils';
 import { logInfo, logWarn, styleKV } from './logger';
 import { ffmpegPath } from './ffmpeg-path';
+import { SafetyMode } from './safety/types';
+import { createEncoder } from './safety/factory';
+import { getEncodingParams } from './encoding-config';
 
 const ensureVideoPath = (targetPath: string): string => {
   const parsed = path.parse(targetPath);
@@ -18,7 +21,8 @@ const ensureVideoPath = (targetPath: string): string => {
 export const encodeFileToVideo = async (
   inputPath: string,
   outputPath?: string | null,
-  forcedResolution?: number | null
+  forcedResolution?: number | null,
+  safetyMode: SafetyMode = 'fullspace'
 ): Promise<void> => {
   if (!ffmpegPath) {
     throw new Error('Bundled ffmpeg not found. Please install dependencies with npm install.');
@@ -38,8 +42,12 @@ export const encodeFileToVideo = async (
   }
 
   const fileSize = stats.size;
-  const metadataBuffer = Buffer.from(`${getExtension(inputPath)};${fileSize};`, 'utf8');
-  const totalDataBytes = metadataBuffer.length + fileSize;
+  const encoder = createEncoder(safetyMode);
+  const extension = getExtension(inputPath);
+  const metadataText = Buffer.from(`${extension};${fileSize};`, 'utf8');
+  const encodedFileSize = encoder.computeEncodedSize(fileSize);
+  const safetyMarkerSize = 3;
+  const totalDataBytes = safetyMarkerSize + metadataText.length + encodedFileSize;
   const layout = computeLayout(totalDataBytes, forcedResolution ?? undefined);
   const paddingBytes = layout.padding;
 
@@ -60,6 +68,7 @@ export const encodeFileToVideo = async (
 
   encodingBar.start(totalDataBytes, 0);
 
+  const encodingParams = getEncodingParams(safetyMode);
   const ffmpegProcess = spawn(
     ffmpegPath,
     [
@@ -82,7 +91,7 @@ export const encodeFileToVideo = async (
       '-preset',
       'medium',
       '-x265-params',
-      'lossless=1',
+      encodingParams.x265Params,
       '-g',
       '1',
       '-bf',
@@ -114,20 +123,33 @@ export const encodeFileToVideo = async (
 
     let processed = 0;
 
-    if (!stdin.write(metadataBuffer)) {
+    const safetyMarker = Buffer.from([
+      safetyMode === 'monospace' ? 0 : safetyMode === 'fullspace' ? 128 : 255,
+      safetyMode === 'monospace' ? 0 : safetyMode === 'fullspace' ? 128 : 255,
+      safetyMode === 'monospace' ? 0 : safetyMode === 'fullspace' ? 128 : 255
+    ]);
+
+    if (!stdin.write(safetyMarker)) {
       await once(stdin, 'drain');
     }
-    processed += metadataBuffer.length;
+    processed += safetyMarker.length;
+    encodingBar.update(processed);
+
+    if (!stdin.write(metadataText)) {
+      await once(stdin, 'drain');
+    }
+    processed += metadataText.length;
     encodingBar.update(processed);
 
     const fileStream = fs.createReadStream(inputPath, { highWaterMark: 256 * 1024 });
 
     for await (const chunk of fileStream) {
       const buffer = chunk as Buffer;
-      if (!stdin.write(buffer)) {
+      const encoded = encoder.encode(buffer);
+      if (!stdin.write(encoded)) {
         await once(stdin, 'drain');
       }
-      processed += buffer.length;
+      processed += encoded.length;
       encodingBar.update(processed);
     }
 

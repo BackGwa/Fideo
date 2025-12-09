@@ -8,6 +8,9 @@ import { logInfo, logWarn, styleKV } from './logger';
 import { probeVideo } from './probe';
 import { ffmpegPath } from './ffmpeg-path';
 import { sanitizeExtension } from './utils';
+import { detectSafetyMode } from './safety/detector';
+import { createDecoder } from './safety/factory';
+import { SafetyDecoder } from './safety/types';
 
 const METADATA_DELIMITER = 59;
 const MAX_METADATA_BYTES = 128;
@@ -63,6 +66,11 @@ export const decodeVideoToFile = async (inputVideoPath: string, outputPath?: str
   const stderrChunks: string[] = [];
   ffmpegProcess.stderr?.on('data', (chunk: Buffer) => stderrChunks.push(chunk.toString()));
 
+  const safetyMarkerBuffer = Buffer.allocUnsafe(3);
+  let safetyMarkerLength = 0;
+  let safetyMarkerRead = false;
+  let decoder: SafetyDecoder | null = null;
+
   const metaBuffer = Buffer.allocUnsafe(MAX_METADATA_BYTES);
   let metaLength = 0;
   let semicolons = 0;
@@ -85,16 +93,18 @@ export const decodeVideoToFile = async (inputVideoPath: string, outputPath?: str
     };
 
     const processPayload = async (chunk: Buffer) => {
-      if (expectedSize === null || received >= expectedSize || !writer) return;
-      const needed = expectedSize - received;
-      const slice = chunk.subarray(0, Math.min(chunk.length, needed));
-      if (slice.length > 0) {
-        if (!writer.write(slice)) {
+      if (expectedSize === null || received >= expectedSize || !writer || !decoder) return;
+
+      const decoded = decoder.decode(chunk, expectedSize - received);
+
+      if (decoded.length > 0) {
+        if (!writer.write(decoded)) {
           await once(writer, 'drain');
         }
-        received += slice.length;
+        received += decoded.length;
         setProgress();
       }
+
       if (received >= expectedSize) {
         writer.end();
         ffmpegProcess.stdout?.pause();
@@ -105,7 +115,20 @@ export const decodeVideoToFile = async (inputVideoPath: string, outputPath?: str
 
     const handleChunk = async (chunk: Buffer) => {
       let offset = 0;
-      if (!metadataParsed) {
+
+      if (!safetyMarkerRead) {
+        while (offset < chunk.length && safetyMarkerLength < 3) {
+          safetyMarkerBuffer[safetyMarkerLength++] = chunk[offset++];
+        }
+
+        if (safetyMarkerLength === 3) {
+          safetyMarkerRead = true;
+          const detectedMode = detectSafetyMode(safetyMarkerBuffer);
+          decoder = createDecoder(detectedMode);
+        }
+      }
+
+      if (safetyMarkerRead && !metadataParsed) {
         while (offset < chunk.length && !metadataParsed) {
           const byte = chunk[offset];
           if (metaLength >= MAX_METADATA_BYTES) {
@@ -160,7 +183,7 @@ export const decodeVideoToFile = async (inputVideoPath: string, outputPath?: str
         }
       }
 
-      if (metadataParsed && offset < chunk.length) {
+      if (safetyMarkerRead && metadataParsed && offset < chunk.length) {
         await processPayload(chunk.subarray(offset));
       }
     };
