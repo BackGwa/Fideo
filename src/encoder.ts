@@ -1,6 +1,5 @@
 import fs from 'fs';
 import path from 'path';
-import os from 'os';
 import { spawn } from 'child_process';
 import { once } from 'events';
 import cliProgress from 'cli-progress';
@@ -14,37 +13,6 @@ const ensureVideoPath = (targetPath: string): string => {
   const parsed = path.parse(targetPath);
   if (parsed.ext) return targetPath;
   return path.join(parsed.dir || '.', `${parsed.name || parsed.base || 'output'}.mp4`);
-};
-
-interface ChunkInfo {
-  index: number;
-  start: number;
-  end: number;
-  size: number;
-}
-
-const readChunk = async (
-  filePath: string,
-  chunk: ChunkInfo,
-  metadataBuffer: Buffer | null
-): Promise<Buffer> => {
-  const buffers: Buffer[] = [];
-
-  if (metadataBuffer && chunk.index === 0) {
-    buffers.push(metadataBuffer);
-  }
-
-  const stream = fs.createReadStream(filePath, {
-    start: chunk.start,
-    end: chunk.end - 1,
-    highWaterMark: 256 * 1024
-  });
-
-  for await (const data of stream) {
-    buffers.push(data as Buffer);
-  }
-
-  return Buffer.concat(buffers);
 };
 
 export const encodeFileToVideo = async (
@@ -84,25 +52,6 @@ export const encodeFileToVideo = async (
   );
   console.log();
 
-  const cpuCount = os.cpus().length;
-  const chunkSize = Math.ceil(fileSize / cpuCount);
-  const chunks: ChunkInfo[] = [];
-
-  for (let i = 0; i < cpuCount; i++) {
-    const start = i * chunkSize;
-    const end = Math.min((i + 1) * chunkSize, fileSize);
-    if (start >= fileSize) break;
-    chunks.push({ index: i, start, end, size: end - start });
-  }
-
-  const chunkBuffers = await Promise.all(
-    chunks.map(chunk => readChunk(inputPath, chunk, chunk.index === 0 ? metadataBuffer : null))
-  );
-
-  const totalBuffer = paddingBytes > 0
-    ? Buffer.concat([...chunkBuffers, Buffer.alloc(paddingBytes, 0)])
-    : Buffer.concat(chunkBuffers);
-
   const encodingBar = new cliProgress.SingleBar({
     format: 'Encoding | {bar} | {percentage}%',
     hideCursor: true,
@@ -110,11 +59,6 @@ export const encodeFileToVideo = async (
   }, cliProgress.Presets.shades_classic);
 
   encodingBar.start(totalDataBytes, 0);
-
-  let processed = 0;
-  const updateProgress = () => {
-    encodingBar.update(processed);
-  };
 
   const ffmpegProcess = spawn(
     ffmpegPath,
@@ -162,26 +106,39 @@ export const encodeFileToVideo = async (
     ffmpegProcess.on('close', (code: number | null) => resolve(code));
   });
 
-  const sendStream = async (): Promise<void> => {
+  const streamToFfmpeg = async (): Promise<void> => {
     const stdin = ffmpegProcess.stdin!;
-    const chunkWriteSize = 64 * 1024;
-    let offset = 0;
+    let processed = 0;
 
-    while (offset < totalBuffer.length) {
-      const chunk = totalBuffer.subarray(offset, offset + chunkWriteSize);
-      if (!stdin.write(chunk)) {
+    if (!stdin.write(metadataBuffer)) {
+      await once(stdin, 'drain');
+    }
+    processed += metadataBuffer.length;
+    encodingBar.update(processed);
+
+    const fileStream = fs.createReadStream(inputPath, { highWaterMark: 256 * 1024 });
+
+    for await (const chunk of fileStream) {
+      const buffer = chunk as Buffer;
+      if (!stdin.write(buffer)) {
         await once(stdin, 'drain');
       }
-      processed += chunk.length;
-      offset += chunk.length;
-      updateProgress();
+      processed += buffer.length;
+      encodingBar.update(processed);
+    }
+
+    if (paddingBytes > 0) {
+      const padding = Buffer.alloc(paddingBytes, 0);
+      if (!stdin.write(padding)) {
+        await once(stdin, 'drain');
+      }
     }
 
     stdin.end();
   };
 
   try {
-    await sendStream();
+    await streamToFfmpeg();
   } catch (err) {
     ffmpegProcess.kill('SIGKILL');
     encodingBar.stop();
