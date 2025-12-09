@@ -1,3 +1,5 @@
+#!/usr/bin/env node
+
 import path from 'path';
 import { Command, InvalidArgumentError } from 'commander';
 import { encodeFileToVideo } from '../encoder';
