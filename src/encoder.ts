@@ -107,7 +107,11 @@ export const encodeFileToVideo = async (
   });
 
   const streamToFfmpeg = async (): Promise<void> => {
-    const stdin = ffmpegProcess.stdin!;
+    const stdin = ffmpegProcess.stdin;
+    if (!stdin) {
+      throw new Error('Failed to access ffmpeg stdin stream.');
+    }
+
     let processed = 0;
 
     if (!stdin.write(metadataBuffer)) {

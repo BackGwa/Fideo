@@ -85,18 +85,18 @@ export const decodeVideoToFile = async (inputVideoPath: string, outputPath?: str
     };
 
     const processPayload = async (chunk: Buffer) => {
-      if (expectedSize === null || received >= expectedSize) return;
+      if (expectedSize === null || received >= expectedSize || !writer) return;
       const needed = expectedSize - received;
       const slice = chunk.subarray(0, Math.min(chunk.length, needed));
       if (slice.length > 0) {
-        if (!writer!.write(slice)) {
-          await once(writer!, 'drain');
+        if (!writer.write(slice)) {
+          await once(writer, 'drain');
         }
         received += slice.length;
         setProgress();
       }
       if (received >= expectedSize) {
-        writer?.end();
+        writer.end();
         ffmpegProcess.stdout?.pause();
         ffmpegProcess.kill('SIGTERM');
         settle();
@@ -192,6 +192,11 @@ export const decodeVideoToFile = async (inputVideoPath: string, outputPath?: str
   });
 
   decodingBar?.stop();
+
+  if (!outputTarget) {
+    throw new Error('Output path was not determined.');
+  }
+
   logInfo(chalk.green('File extracted successfully.'));
-  return outputTarget!;
+  return outputTarget;
 };
