@@ -7,6 +7,11 @@
 **Fideo** is a simple utility that lets you **encode files into MP4 format** or **decode encoded MP4 files back to their original format**.
 It offers an easy-to-use, command-line–based interface.
 
+![GitHub License](https://img.shields.io/github/license/BackGwa/Fideo)
+![GitHub Sponsors](https://img.shields.io/github/sponsors/BackGwa)
+![GitHub Repo stars](https://img.shields.io/github/stars/BackGwa/Fideo)
+![GitHub forks](https://img.shields.io/github/forks/BackGwa/Fideo)
+
 </div>
 
 <br>
