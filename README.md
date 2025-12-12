@@ -40,3 +40,9 @@ Video to File:
 ```bash
 v2f <input_video> [-o <output_file>]
 ```
+
+<br>
+
+## Star History
+
+![Star History Chart](https://api.star-history.com/svg?repos=BackGwa/Fideo&type=Date)
